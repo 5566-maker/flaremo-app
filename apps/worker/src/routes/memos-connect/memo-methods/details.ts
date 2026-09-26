@@ -1,0 +1,221 @@
+import type { MemoRow, UserRow } from "@flaremo/db";
+import {
+  getMemoById,
+  getMemoByIdForViewer,
+  getMemoParent,
+  listAttachmentsForMemosForViewer,
+  listMemoAttachments,
+  listMemoReactions,
+  listMemoRelationsForViewer,
+  listReactionsForMemosForViewer,
+} from "@flaremo/domain";
+import { currentMemoToDto } from "@flaremo/memos";
+import type { getRequestContext } from "../../../context";
+import { CompatValidationError } from "../../../memos-compat/errors";
+import { resolveMemoCreator } from "../../../memos-compat/memo-creator";
+import { memoRelationsToDtos } from "../../../memos-compat/memo-relations";
+import {
+  parseMemosOrderBy,
+  parseMemosState,
+} from "../../../memos-compat/parsing";
+import { normalizeMemoName } from "../../../memos-compat/resource-names";
+import { type ConnectReadContext, optionalString, pageSize } from "../shared";
+
+/**
+ * Shared body-to-legacy-list-query mapping for the authenticated
+ * ListMemos and the anonymous public ListMemos read; both surfaces parsed
+ * identical copies of this shape.
+ */
+export function connectMemoListQuery(body: Record<string, unknown>) {
+  const orderBy = parseMemosOrderBy(
+    optionalString(body.orderBy) ?? "create_time desc",
+  );
+  if (!orderBy) {
+    throw new CompatValidationError(
+      "orderBy must be one supported single-field order such as create_time desc",
+    );
+  }
+  return {
+    page_size: pageSize(body.pageSize),
+    page_token: optionalString(body.pageToken),
+    order_by: orderBy,
+    state: stateToLegacy(optionalString(body.state)),
+    filter: optionalString(body.filter),
+    include_deleted: body.showDeleted === true,
+  };
+}
+
+export async function connectMemoWithDetails(
+  context: Awaited<ReturnType<typeof getRequestContext>>,
+  id: string,
+) {
+  const memo = await getMemoById(
+    context.db,
+    context.user,
+    normalizeMemoName(id),
+  );
+  const [attachments, rows, reactionPage, parent] = await Promise.all([
+    listMemoAttachments(context.db, context.user, memo.id),
+    listMemoRelationsForViewer(context.db, context.user, memo.id),
+    listMemoReactions(context.db, context.user, {
+      memoName: memo.id,
+      pageSize: 1_000,
+    }),
+    getMemoParent(context.db, context.user, memo.id),
+  ]);
+  const relations = await memoRelationsToDtos(rows, (id) =>
+    getMemoById(context.db, context.user, id, { includeDeleted: true }),
+  );
+  return currentMemoToDto(memo, context.user, {
+    attachments,
+    relations,
+    reactions: reactionPage.reactions,
+    parent,
+  });
+}
+
+function groupByContentMemo<T>(
+  rows: T[],
+  memoKey: (row: T) => string | null | undefined,
+): Map<string, T[]> {
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) {
+    const memoId = memoKey(row);
+    if (!memoId) continue;
+    const bucket = grouped.get(memoId) ?? [];
+    bucket.push(row);
+    grouped.set(memoId, bucket);
+  }
+  return grouped;
+}
+
+export async function listMemoAttachmentsForPage(
+  context: Awaited<ReturnType<typeof getRequestContext>>,
+  memoIds: string[],
+) {
+  const attachments = await listAttachmentsForMemosForViewer(
+    context.db,
+    context.user,
+    memoIds,
+  );
+  return groupByContentMemo(attachments, (attachment) => attachment.memoId);
+}
+
+export async function listMemoReactionsForPage(
+  context: Awaited<ReturnType<typeof getRequestContext>>,
+  memoIds: string[],
+) {
+  const reactions = await listReactionsForMemosForViewer(
+    context.db,
+    context.user,
+    memoIds,
+  );
+  return groupByContentMemo(reactions, (reaction) => reaction.contentId);
+}
+
+/**
+ * Hydrate a page of already-scoped memo rows without re-fetching each memo:
+ * attachments and reactions are resolved with one batched query per page,
+ * while relations and the comment parent stay per-memo because most memos
+ * carry none. Keeps the exact DTO shape of the former per-memo detail fetch.
+ */
+export async function hydrateConnectMemos(
+  context: Awaited<ReturnType<typeof getRequestContext>>,
+  memoRows: MemoRow[],
+) {
+  const ids = memoRows.map((memo) => memo.id);
+  const [attachments, reactions] = await Promise.all([
+    listMemoAttachmentsForPage(context, ids),
+    listMemoReactionsForPage(context, ids),
+  ]);
+  return Promise.all(
+    memoRows.map(async (memo) => {
+      const relationRows = await listMemoRelationsForViewer(
+        context.db,
+        context.user,
+        memo.id,
+      );
+      const relations = await memoRelationsToDtos(relationRows, (id) =>
+        getMemoById(context.db, context.user, id, { includeDeleted: true }),
+      );
+      const parent = await getMemoParent(context.db, context.user, memo.id);
+      return currentMemoToDto(memo, context.user, {
+        attachments: attachments.get(memo.id) ?? [],
+        reactions: reactions.get(memo.id) ?? [],
+        relations,
+        parent,
+      });
+    }),
+  );
+}
+
+/**
+ * Anonymous-capable variant for the public Memos read surface, mirroring
+ * connectPublicMemoWithDetails but resolving a page in two batched queries
+ * plus per-memo relation lookups, with creators cached across the page.
+ */
+export async function hydrateConnectPublicMemos(
+  context: ConnectReadContext,
+  memoRows: MemoRow[],
+  parent?: string,
+) {
+  const ids = memoRows.map((memo) => memo.id);
+  const [attachmentsByMemo, reactionsByMemo] = await Promise.all([
+    listAttachmentsForMemosForViewer(context.db, context.user, ids),
+    listReactionsForMemosForViewer(context.db, context.user, ids),
+  ]);
+  const attachments = groupByContentMemo(
+    attachmentsByMemo,
+    (attachment) => attachment.memoId,
+  );
+  const reactions = groupByContentMemo(
+    reactionsByMemo,
+    (reaction) => reaction.contentId,
+  );
+  const creators = new Map<string, UserRow>();
+  return Promise.all(
+    memoRows.map(async (memo) => {
+      const relationRows = await listMemoRelationsForViewer(
+        context.db,
+        context.user,
+        memo.id,
+      );
+      const relations = await memoRelationsToDtos(
+        relationRows,
+        (id) => getMemoByIdForViewer(context.db, context.user, id),
+        { skipUnavailable: true },
+      );
+      let creator = creators.get(memo.userId);
+      if (!creator) {
+        creator = await resolveMemoCreator(context, memo);
+        creators.set(memo.userId, creator);
+      }
+      return currentMemoToDto(memo, creator, {
+        attachments: attachments.get(memo.id) ?? [],
+        reactions: reactions.get(memo.id) ?? [],
+        relations,
+        ...(parent ? { parent } : {}),
+      });
+    }),
+  );
+}
+
+/**
+ * State to the domain status. The upstream ListMemosRequest.state only
+ * exposes NORMAL and ARCHIVED (STATE_UNSPECIFIED means "no filter"), so
+ * trashed/deleted rows are reached through DeleteMemo and showDeleted, never
+ * through the state field — matching the current REST surface.
+ */
+export function stateToLegacy(value: string | undefined) {
+  const normalized = parseMemosState(value ?? "NORMAL");
+  if (
+    !normalized &&
+    (value ?? "NORMAL").trim().toUpperCase() !== "STATE_UNSPECIFIED"
+  ) {
+    throw new CompatValidationError(`Unsupported memo state: ${value}`);
+  }
+  if (normalized && normalized !== "normal" && normalized !== "archived") {
+    throw new CompatValidationError(`Unsupported memo state: ${value}`);
+  }
+  return normalized;
+}

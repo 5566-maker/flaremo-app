@@ -1,0 +1,238 @@
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useCallback, useMemo, useState } from "react";
+import {
+  getCaptureStatus,
+  getCurrentFlareMoUser,
+  getDailyReview,
+  getMemoStats,
+  getTagHierarchy,
+  getVectorUsage,
+  listMemos,
+  listTasks,
+  type MemoSpace,
+  type MemoStatsResponse,
+  semanticSearchMemos,
+  type Task,
+} from "@/api";
+import type { ExplorerView as ViewMode } from "@/components/flaremo-explorer";
+import { todayKey } from "@/lib/calendar-date";
+import { viewToMemoState } from "@/lib/memo-cache";
+import { queryKeys } from "@/lib/query-keys";
+
+const PAGE_SIZE = 30;
+const EMPTY_STATS: MemoStatsResponse = {
+  counts: { normal: 0, archived: 0, trashed: 0, total: 0 },
+  active_days: 0,
+  tags: [],
+  activity: [],
+};
+
+type WorkspaceQueryFilters = {
+  /** Space partition the timeline is scoped to. */
+  space: MemoSpace;
+  /** Which of the all / archived / trashed timelines is showing. */
+  view: ViewMode;
+  activeTag?: string;
+  /** True when the timeline is filtered down to untagged memos. */
+  untagged: boolean;
+  /** Trimmed search box contents; empty when nothing is typed. */
+  searchQuery: string;
+  /** Whether searchQuery is non-empty. */
+  isSearching: boolean;
+  /** The query when it is exactly one local day; see dayFilterFromQuery. */
+  dayFilter: string | null;
+  timeZone: string;
+};
+
+/**
+ * Every server read behind the workspace — memo timeline and stats, tag
+ * hierarchy, the signed-in member and their capture seat, semantic/keyword
+ * search, and the "on this day" teaser — plus the derived lists and flags the
+ * render tree consumes.
+ */
+export function useWorkspaceQueries({
+  space,
+  view,
+  activeTag,
+  untagged,
+  searchQuery,
+  isSearching,
+  dayFilter,
+  timeZone,
+}: WorkspaceQueryFilters) {
+  const [semanticMode, setSemanticMode] = useState(false);
+
+  const vectorUsageQuery = useQuery({
+    queryKey: ["vector-usage"],
+    queryFn: () => getVectorUsage(),
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+  // Semantic search is hidden when the plan has no budget for it (quota 0)
+  // or the capability itself is disabled server-side.
+  const semanticEnabled = useMemo(() => {
+    const plan = vectorUsageQuery.data?.plan;
+    if (!plan) return false;
+    const limit =
+      plan.user?.limits.semanticSearchQueriesPerMonth ??
+      plan.limits.semanticSearchQueriesPerMonth;
+    return typeof limit === "number" && limit > 0;
+  }, [vectorUsageQuery.data]);
+
+  const isSemanticSearch =
+    semanticMode && semanticEnabled && isSearching && !dayFilter;
+  const toggleSemantic = useCallback(
+    () => setSemanticMode((value) => !value),
+    [],
+  );
+  const semanticResultsQuery = useQuery({
+    queryKey: ["semantic-search", space, searchQuery],
+    enabled: isSemanticSearch,
+    queryFn: ({ signal }) =>
+      semanticSearchMemos(
+        searchQuery,
+        20,
+        signal,
+        space === "all" ? undefined : space,
+      ),
+    retry: false,
+  });
+  const semanticMemos = useMemo(
+    () => semanticResultsQuery.data?.memos ?? [],
+    [semanticResultsQuery.data],
+  );
+
+  // Plain keyword search rides the memos endpoint; tasks join the results
+  // client-side from the shared ["tasks"] cache (title/notes substring match).
+  const keywordSearch = isSearching && !dayFilter && !isSemanticSearch;
+  const taskSearchQuery = useQuery({
+    queryKey: queryKeys.tasks.all,
+    queryFn: () => listTasks(),
+    enabled: keywordSearch,
+  });
+  const matchingTasks = useMemo(() => {
+    if (!keywordSearch) return [] as Task[];
+    const needle = searchQuery.toLocaleLowerCase();
+    return (taskSearchQuery.data?.tasks ?? [])
+      .filter(
+        (task) =>
+          task.title.toLocaleLowerCase().includes(needle) ||
+          (task.notes?.toLocaleLowerCase().includes(needle) ?? false),
+      )
+      .slice(0, 5);
+  }, [keywordSearch, taskSearchQuery.data, searchQuery]);
+
+  const memosQuery = useInfiniteQuery({
+    queryKey: ["memos", space, view, searchQuery, activeTag, untagged],
+    initialPageParam: undefined as string | undefined,
+    enabled: !isSemanticSearch,
+    queryFn: ({ pageParam, signal }) =>
+      listMemos(
+        {
+          include_deleted: !isSearching && view === "trashed",
+          page_size: PAGE_SIZE,
+          page_token: pageParam,
+          q: searchQuery || undefined,
+          state: isSearching ? undefined : viewToMemoState(view),
+          tag: activeTag,
+          untagged,
+          space: space === "all" ? undefined : space,
+        },
+        signal,
+      ),
+    getNextPageParam: (lastPage) => lastPage.next_page_token,
+    retry: false,
+  });
+  const statsQuery = useQuery({
+    queryKey: ["memo-stats", space, timeZone],
+    queryFn: () => getMemoStats(timeZone, space),
+    retry: false,
+  });
+  const tagHierarchyQuery = useQuery({
+    queryKey: ["tag-hierarchy", space],
+    queryFn: () => getTagHierarchy(space),
+    retry: false,
+  });
+  const currentUserQuery = useQuery({
+    queryKey: queryKeys.currentUser,
+    queryFn: getCurrentFlareMoUser,
+    staleTime: 60_000,
+    retry: false,
+  });
+  const captureStatusQuery = useQuery({
+    queryKey: queryKeys.captureStatus.forUser(currentUserQuery.data?.id ?? ""),
+    queryFn: getCaptureStatus,
+    staleTime: 30_000,
+    retry: false,
+  });
+  // Readers (time-boxed read-only seats) browse the team space but never
+  // publish into it; their composer target stays personal everywhere.
+  const isReader = currentUserQuery.data?.role === "reader";
+  const canPublishTeam = Boolean(currentUserQuery.data?.team) && !isReader;
+  const teamExpired = Boolean(currentUserQuery.data?.team_expired);
+  // "On this day" teaser for the timeline top: notes from past years dated
+  // today. The query shares the daily-review page's cache entry, so landing
+  // on the banner costs nothing extra.
+  const [today, tzOffset] = useMemo(
+    () => [todayKey(), -new Date().getTimezoneOffset()],
+    [],
+  );
+  // Gate the fetch on the same filters that gate the banner: a filtered
+  // timeline never renders it, so the request would be pure waste.
+  const onThisDayEnabled =
+    view === "all" &&
+    !dayFilter &&
+    !searchQuery &&
+    !activeTag &&
+    !untagged &&
+    !isSemanticSearch;
+  const onThisDayQuery = useQuery({
+    queryKey: ["daily-review", today, tzOffset],
+    enabled: onThisDayEnabled,
+    queryFn: () => getDailyReview(today, tzOffset),
+    staleTime: 60_000,
+    retry: false,
+  });
+  const showOnThisDayBanner =
+    onThisDayEnabled && (onThisDayQuery.data?.memos.length ?? 0) > 0;
+
+  const memos = useMemo(
+    () => memosQuery.data?.pages.flatMap((page) => page.memos) ?? [],
+    [memosQuery.data],
+  );
+  const displayedMemos = isSemanticSearch ? semanticMemos : memos;
+  const attachmentsByMemo = useMemo(
+    () =>
+      new Map(
+        displayedMemos.map(
+          (memo) => [memo.name, memo.attachments ?? []] as const,
+        ),
+      ),
+    [displayedMemos],
+  );
+  const stats = statsQuery.data ?? EMPTY_STATS;
+
+  return {
+    attachmentsByMemo,
+    canPublishTeam,
+    captureStatusQuery,
+    currentUserQuery,
+    displayedMemos,
+    isReader,
+    isSemanticSearch,
+    keywordSearch,
+    matchingTasks,
+    memosQuery,
+    onThisDayQuery,
+    semanticEnabled,
+    semanticMode,
+    semanticResultsQuery,
+    showOnThisDayBanner,
+    stats,
+    tagHierarchyQuery,
+    taskSearchQuery,
+    teamExpired,
+    toggleSemantic,
+    vectorUsageQuery,
+  };
+}
